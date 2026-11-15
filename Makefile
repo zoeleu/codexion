@@ -42,7 +42,7 @@ norm:
 	norminette include src
 
 build/wait_regression: tests/wait_regression.c $(filter-out build/main.o,$(OBJ)) include/codexion.h
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(filter-out build/main.o,$(OBJ)) -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(filter-out build/main.o,$(OBJ)) -Wl,--wrap=pthread_cond_timedwait -o $@
 
 test: $(NAME) build/wait_regression
 	timeout 2 ./build/wait_regression
