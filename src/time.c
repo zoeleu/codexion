@@ -3,10 +3,10 @@
 /*                                                        :::      ::::::::   */
 /*   time.c                                             :+:      :+:    :+:   */
 /*                                                    +:+ +:+         +:+     */
-/*   By: zleullie <zleullie@student.42.fr>          +#+  +:+       +#+        */
+/*   By: zleullie <zleullie@student.42sp.org.br>    +#+  +:+       +#+        */
 /*                                                +#+#+#+#+#+   +#+           */
 /*   Created: 2026/11/11 00:00:00 by zleullie          #+#    #+#             */
-/*   Updated: 2026/11/11 20:52:14 by zleullie         ###   ########.fr       */
+/*   Updated: 2026/11/15 00:00:00 by zleullie         ###   ########.fr       */
 /*                                                                            */
 /* ************************************************************************** */
 
@@ -20,7 +20,6 @@ struct timespec	time_now(void)
 	return (now);
 }
 
-/* Milliseconds must be nonnegative and the result must fit in time_t. */
 struct timespec	time_add_ms(struct timespec time, long milliseconds)
 {
 	time.tv_sec += milliseconds / 1000;
@@ -33,25 +32,20 @@ struct timespec	time_add_ms(struct timespec time, long milliseconds)
 	return (time);
 }
 
+/* Returns 1 once now is at or after deadline. */
 int	time_reached(struct timespec now, struct timespec deadline)
 {
-	return (now.tv_sec > deadline.tv_sec
-		|| (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec));
+	if (now.tv_sec != deadline.tv_sec)
+		return (now.tv_sec > deadline.tv_sec);
+	return (now.tv_nsec >= deadline.tv_nsec);
 }
 
 long long	time_elapsed_ms(struct timespec start, struct timespec end)
 {
-	long long	seconds;
-	long		nanoseconds;
+	long long	start_ms;
+	long long	end_ms;
 
-	if (!time_reached(end, start))
-		return (0);
-	seconds = end.tv_sec - start.tv_sec;
-	nanoseconds = end.tv_nsec - start.tv_nsec;
-	if (nanoseconds < 0)
-	{
-		seconds--;
-		nanoseconds += 1000000000L;
-	}
-	return (seconds * 1000 + nanoseconds / 1000000L);
+	start_ms = start.tv_sec * 1000LL + start.tv_nsec / 1000000;
+	end_ms = end.tv_sec * 1000LL + end.tv_nsec / 1000000;
+	return (end_ms - start_ms);
 }

@@ -12,17 +12,18 @@
 
 #include "codexion.h"
 
-/* Lowers wake to a pending cooldown so expiry needs no wakeup signal. */
+/* A free dongle still cooling down counts as busy; its cooldown end
+   shortens the wake time so expiry needs no wakeup signal. */
 static int	dongle_busy(t_dongle *dongle, struct timespec now,
 		struct timespec *wake)
 {
 	struct timespec	cooldown;
 	int				busy;
 
-	pthread_mutex_lock(&dongle->dongle_taken);
+	pthread_mutex_lock(&dongle->mutex);
 	busy = dongle->in_use;
 	cooldown = dongle->cooldown_until;
-	pthread_mutex_unlock(&dongle->dongle_taken);
+	pthread_mutex_unlock(&dongle->mutex);
 	if (!busy && !time_reached(now, cooldown))
 	{
 		busy = 1;
@@ -32,81 +33,96 @@ static int	dongle_busy(t_dongle *dongle, struct timespec now,
 	return (busy);
 }
 
-/* Caller holds state_mutex and the coder's request heads this heap. */
-static void	dongle_take(t_dongle *dongle, t_coder *coder, int slot)
+static void	dongle_take(t_coder *coder, t_dongle *dongle, int slot)
 {
-	pthread_mutex_lock(&dongle->dongle_taken);
+	pthread_mutex_lock(&dongle->mutex);
 	dongle->in_use = 1;
-	pthread_mutex_unlock(&dongle->dongle_taken);
-	heap_pop(&dongle->requests);
-	coder->taken_dongles[slot] = dongle;
-	log_event_locked(coder->simulation, coder->index, LOG_DONGLE);
+	pthread_mutex_unlock(&dongle->mutex);
+	coder->taken[slot] = dongle;
+	coder_log(coder, "has taken a dongle");
 }
 
-/* Returns 1 granted, 0 keep waiting, -1 abort; wake bounds the wait.
-   A lone coder takes its only dongle, then waits for a second forever. */
-static int	dongle_try_grant(t_dongle *a, t_dongle *b, t_request *request,
+/* Caller holds sim->mutex. Returns 1 when compiling starts, 0 to wait until
+   *wake, -1 on burnout or shutdown. A lone coder takes its only dongle,
+   then waits for a second one until it burns out. */
+static int	dongle_try_grant(t_coder *coder, t_request *request,
 		struct timespec *wake)
 {
 	struct timespec	now;
-	t_coder			*coder;
 	int				busy;
 
-	coder = request->coder;
 	now = time_now();
 	*wake = request->deadline;
-	if (coder->simulation->result != SIM_RUNNING
+	if (coder->sim->result != SIM_RUNNING
 		|| time_reached(now, request->deadline))
 		return (-1);
-	if (heap_peek(&a->requests) != request
-		|| heap_peek(&b->requests) != request)
+	if (heap_peek(&coder->left->requests) != request
+		|| heap_peek(&coder->right->requests) != request)
 		return (0);
-	busy = dongle_busy(a, now, wake);
-	if (dongle_busy(b, now, wake) || busy)
+	busy = dongle_busy(coder->left, now, wake);
+	if (dongle_busy(coder->right, now, wake) || busy)
 		return (0);
-	dongle_take(a, coder, 0);
-	if (a == b)
+	dongle_take(coder, coder->left, 0);
+	if (coder->left == coder->right)
 		return (0);
-	dongle_take(b, coder, 1);
+	dongle_take(coder, coder->right, 1);
+	coder->burnout_time = time_add_ms(now, coder->sim->config.time_to_burnout);
+	coder_log(coder, "is compiling");
 	return (1);
 }
 
-/* Caller holds state_mutex. Returns 1 on wait error (stops the run). */
-static int	dongle_sleep(t_simulation *sim, const struct timespec *wake)
-{
-	int	error;
-
-	error = pthread_cond_timedwait(&sim->phase_condition,
-			&sim->state_mutex, wake);
-	if (error == 0 || error == ETIMEDOUT)
-		return (0);
-	sim->result = SIM_ERROR;
-	return (1);
-}
-
-/* Takes both dongles atomically: nothing is held while waiting, so the
-   earliest-deadline waiter always heads both heaps and cannot starve.
-   Returns 1 when both dongles are held, 0 on burnout or shutdown. */
-int	dongle_acquire(t_coder *coder, t_dongle *a, t_dongle *b)
+/* Queues one request in both heaps and takes both dongles at once when it
+   heads both. Nothing is held while waiting, so there is no hold-and-wait.
+   Returns 1 once compiling, 0 on burnout or shutdown. */
+int	dongle_acquire(t_coder *coder)
 {
 	t_simulation	*sim;
 	t_request		request;
 	struct timespec	wake;
 	int				status;
 
-	sim = coder->simulation;
-	request.coder = coder;
+	sim = coder->sim;
+	pthread_mutex_lock(&sim->mutex);
+	request = (t_request){coder, coder->burnout_time};
 	status = -1;
-	pthread_mutex_lock(&sim->state_mutex);
-	if (dongle_enqueue_pair(a, b, &request))
+	if (heap_push(&coder->left->requests, &request)
+		|| (coder->right != coder->left
+			&& heap_push(&coder->right->requests, &request)))
+		simulation_stop(sim, SIM_ERROR);
+	else
+		status = dongle_try_grant(coder, &request, &wake);
+	while (status == 0)
 	{
-		status = dongle_try_grant(a, b, &request, &wake);
-		while (status == 0 && !dongle_sleep(sim, &wake))
-			status = dongle_try_grant(a, b, &request, &wake);
-		heap_remove(&a->requests, &request);
-		heap_remove(&b->requests, &request);
-		pthread_cond_broadcast(&sim->phase_condition);
+		pthread_cond_timedwait(&sim->cond, &sim->mutex, &wake);
+		status = dongle_try_grant(coder, &request, &wake);
 	}
-	pthread_mutex_unlock(&sim->state_mutex);
+	heap_remove(&coder->left->requests, &request);
+	heap_remove(&coder->right->requests, &request);
+	pthread_cond_broadcast(&sim->cond);
+	pthread_mutex_unlock(&sim->mutex);
 	return (status == 1);
+}
+
+/* Never holds a dongle mutex while taking sim->mutex. */
+void	dongle_release(t_coder *coder)
+{
+	t_dongle	*dongle;
+	int			i;
+
+	i = -1;
+	while (++i < 2)
+	{
+		dongle = coder->taken[i];
+		if (dongle == NULL)
+			continue ;
+		pthread_mutex_lock(&dongle->mutex);
+		dongle->in_use = 0;
+		dongle->cooldown_until = time_add_ms(time_now(),
+				coder->sim->config.dongle_cooldown);
+		pthread_mutex_unlock(&dongle->mutex);
+		coder->taken[i] = NULL;
+	}
+	pthread_mutex_lock(&coder->sim->mutex);
+	pthread_cond_broadcast(&coder->sim->cond);
+	pthread_mutex_unlock(&coder->sim->mutex);
 }
