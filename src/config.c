@@ -47,7 +47,7 @@ static int	parse_numbers(char **argv, long *values)
 			limit = INT_MAX;
 		if (parse_number(argv[i + 1], limit, &values[i]) != 0)
 			return (-1);
-		if (values[i] == 0 && i != 6)
+		if (values[i] == 0 && i != 5 && i != 6)
 			return (-1);
 		i++;
 	}
